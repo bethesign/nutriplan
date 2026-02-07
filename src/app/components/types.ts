@@ -1,5 +1,6 @@
 export interface FoodItem {
   id: string;
+  food_id?: string; // UUID from foods table (for admin operations)
   name: string;
   baseWeight: number;
   note?: string; // e.g., "(1/7)"
@@ -11,6 +12,7 @@ export interface Category {
   id: string;
   name: string;
   icon: string;
+  is_optional?: boolean;
   items: FoodItem[];
 }
 
@@ -18,6 +20,7 @@ export interface Meal {
   id: string;
   name: string;
   icon: string;
+  is_free?: boolean;
   categories: Category[];
 }
 

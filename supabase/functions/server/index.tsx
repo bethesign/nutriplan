@@ -2,28 +2,8 @@ import { Hono } from "npm:hono";
 import { cors } from "npm:hono/cors";
 import { logger } from "npm:hono/logger";
 import { createClient } from "jsr:@supabase/supabase-js@2.49.8";
-import * as kv from "./kv_store.tsx";
 
 const app = new Hono();
-
-// Seed: ensure at least one demo invited email exists
-(async () => {
-  try {
-    const demoEmail = "demo@nutriplan.it";
-    const existing = await kv.get(`invited_email:${demoEmail}`);
-    if (!existing) {
-      await kv.set(`invited_email:${demoEmail}`, {
-        email: demoEmail,
-        name: "Utente Demo",
-        invited_by: "system",
-        invited_at: new Date().toISOString(),
-      });
-      console.log(`Seed: invited email ${demoEmail} created.`);
-    }
-  } catch (err) {
-    console.log("Seed error (non-blocking):", err);
-  }
-})();
 
 // Enable logger
 app.use("*", logger(console.log));
@@ -46,7 +26,6 @@ const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 const anonKey = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
 
 // Server-side clients: disable auto-refresh and session persistence
-// to prevent internal state conflicts in a stateless server environment.
 const serverAuthOptions = {
   auth: {
     autoRefreshToken: false,
@@ -58,45 +37,31 @@ const serverAuthOptions = {
 const adminSupabase = createClient(supabaseUrl, serviceRoleKey, serverAuthOptions);
 const anonSupabase = createClient(supabaseUrl, anonKey, serverAuthOptions);
 
-// Helper: verify authenticated user from Hono context
-// The frontend sends the user JWT as query parameter `_t` because:
-// 1. Kong requires Authorization to contain the project's anon key
-// 2. Custom headers (x-user-token) trigger CORS preflight failures at Kong level
-// Query parameters bypass CORS entirely.
+// ─── Helpers ────────────────────────────────────────────────
+
 const authenticateUser = async (c: any) => {
-  // Read user JWT from the `_t` query parameter
   const url = new URL(c.req.url);
   const userToken = url.searchParams.get("_t");
   if (!userToken) {
-    console.log("Auth: No _t query parameter");
     return { user: null, reason: "missing_token" };
   }
-  // Reject if the token is the anon key itself (not a user JWT)
   if (userToken === anonKey) {
-    console.log("Auth: Received anon key instead of user JWT in _t param");
     return { user: null, reason: "anon_key_not_jwt" };
   }
   try {
-    const {
-      data: { user },
-      error,
-    } = await anonSupabase.auth.getUser(userToken);
+    const { data: { user }, error } = await anonSupabase.auth.getUser(userToken);
     if (error) {
-      console.log("Auth: getUser error:", error.message, "| token length:", userToken.length);
       return { user: null, reason: `getUser_error: ${error.message}` };
     }
     if (!user?.id) {
-      console.log("Auth: No user id returned");
       return { user: null, reason: "no_user_id" };
     }
     return { user, reason: null };
   } catch (err) {
-    console.log("Auth: Exception during getUser:", err);
     return { user: null, reason: `exception: ${err}` };
   }
 };
 
-// Helper: safely parse JSON body from Hono context
 const parseBody = async (c: any) => {
   try {
     return await c.req.json();
@@ -106,14 +71,66 @@ const parseBody = async (c: any) => {
   }
 };
 
-// Health check endpoint
+// Middleware: require admin role
+const requireAdmin = async (c: any, next: any) => {
+  const { user, reason } = await authenticateUser(c);
+  if (!user) {
+    return c.json({ error: "Non autorizzato.", reason }, 401);
+  }
+  const { data: profile } = await adminSupabase
+    .from("profiles")
+    .select("role")
+    .eq("id", user.id)
+    .single();
+  if (!profile || profile.role !== "admin") {
+    return c.json({ error: "Accesso riservato agli amministratori." }, 403);
+  }
+  c.set("user", user);
+  return next();
+};
+
+// Helper: ensure profile exists
+const ensureProfile = async (userId: string, email: string) => {
+  const { data: profile } = await adminSupabase
+    .from("profiles")
+    .select("*")
+    .eq("id", userId)
+    .single();
+
+  if (profile) return profile;
+
+  const newProfile = {
+    id: userId,
+    email: email || "",
+    name: "",
+    gender: null,
+    birth_date: null,
+    height_cm: null,
+    current_weight_kg: null,
+    goal: null,
+  };
+  const { data: created, error } = await adminSupabase
+    .from("profiles")
+    .insert(newProfile)
+    .select()
+    .single();
+
+  if (error) {
+    console.log("ensureProfile insert error:", error.message);
+    return newProfile;
+  }
+  return created;
+};
+
+// ─── Health ─────────────────────────────────────────────────
+
 app.get("/make-server-48e8ada4/health", (c) => {
   return c.json({ status: "ok" });
 });
 
-// ─── AUTH ROUTES ───
+// ─── AUTH ROUTES ────────────────────────────────────────────
 
-// POST /check-email — Check if email is invited and if user already exists
+// POST /check-email
 app.post("/make-server-48e8ada4/check-email", async (c) => {
   try {
     const body = await parseBody(c);
@@ -123,16 +140,19 @@ app.post("/make-server-48e8ada4/check-email", async (c) => {
 
     const normalizedEmail = body.email.toLowerCase().trim();
 
-    // Check if email is in the invited list
-    const invited = await kv.get(`invited_email:${normalizedEmail}`);
-    if (!invited) {
+    const { data: invitation } = await adminSupabase
+      .from("invitations")
+      .select("id")
+      .eq("email", normalizedEmail)
+      .maybeSingle();
+
+    if (!invitation) {
       return c.json({
         status: "not_invited",
         message: "Questa email non è autorizzata. Contatta l'amministratore.",
       });
     }
 
-    // Check if user already exists in Supabase Auth
     const { data: usersData } = await adminSupabase.auth.admin.listUsers({
       page: 1,
       perPage: 1000,
@@ -159,7 +179,7 @@ app.post("/make-server-48e8ada4/check-email", async (c) => {
   }
 });
 
-// POST /signup — Create a new user (first-time onboarding)
+// POST /signup
 app.post("/make-server-48e8ada4/signup", async (c) => {
   try {
     const body = await parseBody(c);
@@ -169,17 +189,20 @@ app.post("/make-server-48e8ada4/signup", async (c) => {
 
     const normalizedEmail = body.email.toLowerCase().trim();
 
-    // Verify email is invited
-    const invited = await kv.get(`invited_email:${normalizedEmail}`);
-    if (!invited) {
+    const { data: invitation } = await adminSupabase
+      .from("invitations")
+      .select("id, name")
+      .eq("email", normalizedEmail)
+      .maybeSingle();
+
+    if (!invitation) {
       return c.json({ error: "Email non autorizzata." }, 403);
     }
 
     const { data, error } = await adminSupabase.auth.admin.createUser({
       email: normalizedEmail,
       password: body.password,
-      user_metadata: { name: body.name || invited.name || "" },
-      // Automatically confirm the user's email since an email server hasn't been configured.
+      user_metadata: { name: body.name || invitation.name || "" },
       email_confirm: true,
     });
 
@@ -188,20 +211,19 @@ app.post("/make-server-48e8ada4/signup", async (c) => {
       return c.json({ error: `Errore nella registrazione: ${error.message}` }, 400);
     }
 
-    // Initialize empty profile in KV
-    const profileData = {
-      user_id: data.user.id,
+    // Create profile in relational table
+    await adminSupabase.from("profiles").insert({
+      id: data.user.id,
       email: normalizedEmail,
-      name: body.name || invited.name || "",
-      gender: null,
-      birth_date: null,
-      height_cm: null,
-      current_weight_kg: null,
-      goal: null,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    };
-    await kv.set(`profile:${data.user.id}`, profileData);
+      name: body.name || invitation.name || "",
+    });
+
+    // Mark invitation as accepted
+    await adminSupabase
+      .from("invitations")
+      .update({ accepted_at: new Date().toISOString() })
+      .eq("email", normalizedEmail);
+
     console.log("Signup: profile created for user", data.user.id);
 
     return c.json({
@@ -215,13 +237,13 @@ app.post("/make-server-48e8ada4/signup", async (c) => {
   }
 });
 
-// ─── INVITE MANAGEMENT (admin) ───
+// ─── INVITE MANAGEMENT ──────────────────────────────────────
 
-// POST /invite — Add an email to the invited list
+// POST /invite
 app.post("/make-server-48e8ada4/invite", async (c) => {
   try {
-    const user = await authenticateUser(c);
-    if (!user.user) {
+    const { user } = await authenticateUser(c);
+    if (!user) {
       return c.json({ error: "Non autorizzato." }, 401);
     }
 
@@ -231,12 +253,20 @@ app.post("/make-server-48e8ada4/invite", async (c) => {
     }
 
     const normalizedEmail = body.email.toLowerCase().trim();
-    await kv.set(`invited_email:${normalizedEmail}`, {
-      email: normalizedEmail,
-      name: body.name || "",
-      invited_by: user.user.id,
-      invited_at: new Date().toISOString(),
-    });
+
+    const { error } = await adminSupabase.from("invitations").upsert(
+      {
+        email: normalizedEmail,
+        name: body.name || "",
+        invited_by: user.id,
+        invited_at: new Date().toISOString(),
+      },
+      { onConflict: "email" }
+    );
+
+    if (error) {
+      return c.json({ error: `Errore: ${error.message}` }, 500);
+    }
 
     return c.json({ status: "ok", message: `${normalizedEmail} invitato con successo.` });
   } catch (err) {
@@ -245,31 +275,36 @@ app.post("/make-server-48e8ada4/invite", async (c) => {
   }
 });
 
-// GET /invited — List invited emails by the current user
+// GET /invited
 app.get("/make-server-48e8ada4/invited", async (c) => {
   try {
-    const user = await authenticateUser(c);
-    if (!user.user) {
+    const { user } = await authenticateUser(c);
+    if (!user) {
       return c.json({ error: "Non autorizzato." }, 401);
     }
 
-    const allInvited = await kv.getByPrefix("invited_email:");
-    // Filter: only show invites created by the current user
-    const myInvites = allInvited.filter(
-      (entry: any) => entry.invited_by === user.user!.id
-    );
-    return c.json({ invited: myInvites });
+    const { data, error } = await adminSupabase
+      .from("invitations")
+      .select("email, name, invited_by, invited_at, accepted_at")
+      .eq("invited_by", user.id)
+      .order("invited_at", { ascending: false });
+
+    if (error) {
+      return c.json({ error: `Errore: ${error.message}` }, 500);
+    }
+
+    return c.json({ invited: data || [] });
   } catch (err) {
     console.log("Error in invited list:", err);
     return c.json({ error: `Errore nel recupero inviti: ${err}` }, 500);
   }
 });
 
-// DELETE /invite — Remove an invited email (only if invited by the current user)
+// DELETE /invite
 app.delete("/make-server-48e8ada4/invite", async (c) => {
   try {
-    const user = await authenticateUser(c);
-    if (!user.user) {
+    const { user } = await authenticateUser(c);
+    if (!user) {
       return c.json({ error: "Non autorizzato." }, 401);
     }
 
@@ -279,17 +314,21 @@ app.delete("/make-server-48e8ada4/invite", async (c) => {
     }
 
     const normalizedEmail = body.email.toLowerCase().trim();
-    const existing = await kv.get(`invited_email:${normalizedEmail}`);
 
-    // Only allow deletion if the current user is the one who invited this email
+    const { data: existing } = await adminSupabase
+      .from("invitations")
+      .select("id, invited_by")
+      .eq("email", normalizedEmail)
+      .maybeSingle();
+
     if (!existing) {
       return c.json({ error: "Invito non trovato." }, 404);
     }
-    if (existing.invited_by !== user.user.id) {
+    if (existing.invited_by !== user.id) {
       return c.json({ error: "Puoi rimuovere solo gli inviti che hai creato tu." }, 403);
     }
 
-    await kv.del(`invited_email:${normalizedEmail}`);
+    await adminSupabase.from("invitations").delete().eq("id", existing.id);
     return c.json({ status: "ok", message: `${normalizedEmail} rimosso dalla lista inviti.` });
   } catch (err) {
     console.log("Error in delete invite:", err);
@@ -297,40 +336,17 @@ app.delete("/make-server-48e8ada4/invite", async (c) => {
   }
 });
 
-// ─── PROFILE ROUTES ───
+// ─── PROFILE ROUTES ─────────────────────────────────────────
 
-// Helper: ensure profile exists, create empty one if missing
-const ensureProfile = async (userId: string, email: string) => {
-  let profile = await kv.get(`profile:${userId}`);
-  if (!profile) {
-    console.log(`Profile not found for ${userId}, creating empty profile`);
-    profile = {
-      user_id: userId,
-      email: email || "",
-      name: "",
-      gender: null,
-      birth_date: null,
-      height_cm: null,
-      current_weight_kg: null,
-      goal: null,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    };
-    await kv.set(`profile:${userId}`, profile);
-  }
-  return profile;
-};
-
-// GET /profile — Get current user profile
+// GET /profile
 app.get("/make-server-48e8ada4/profile", async (c) => {
   try {
-    const user = await authenticateUser(c);
-    if (!user.user) {
+    const { user } = await authenticateUser(c);
+    if (!user) {
       return c.json({ error: "Non autorizzato." }, 401);
     }
 
-    const profile = await ensureProfile(user.user.id, user.user.email || "");
-    console.log("GET profile for", user.user.id, "→", JSON.stringify(profile).slice(0, 200));
+    const profile = await ensureProfile(user.id, user.email || "");
     return c.json({ profile });
   } catch (err) {
     console.log("Error in get profile:", err);
@@ -338,11 +354,11 @@ app.get("/make-server-48e8ada4/profile", async (c) => {
   }
 });
 
-// PUT /profile — Update current user profile
+// PUT /profile
 app.put("/make-server-48e8ada4/profile", async (c) => {
   try {
-    const user = await authenticateUser(c);
-    if (!user.user) {
+    const { user } = await authenticateUser(c);
+    if (!user) {
       return c.json({ error: "Non autorizzato." }, 401);
     }
 
@@ -351,29 +367,44 @@ app.put("/make-server-48e8ada4/profile", async (c) => {
       return c.json({ error: "Dati profilo non validi." }, 400);
     }
 
-    console.log("PUT profile for", user.user.id, "updates:", JSON.stringify(updates).slice(0, 300));
+    // Ensure profile exists first
+    await ensureProfile(user.id, user.email || "");
 
-    const existing = await ensureProfile(user.user.id, user.user.email || "");
-    const merged = {
-      ...existing,
-      ...updates,
-      user_id: user.user.id,
-      updated_at: new Date().toISOString(),
-    };
-    await kv.set(`profile:${user.user.id}`, merged);
-    console.log("PUT profile saved for", user.user.id);
-    return c.json({ profile: merged });
+    // Only allow updating safe fields
+    const safeFields: Record<string, any> = {};
+    const allowedKeys = ["name", "gender", "birth_date", "height_cm", "current_weight_kg", "goal"];
+    for (const key of allowedKeys) {
+      if (key in updates) {
+        safeFields[key] = updates[key];
+      }
+    }
+
+    const { data: updated, error } = await adminSupabase
+      .from("profiles")
+      .update(safeFields)
+      .eq("id", user.id)
+      .select()
+      .single();
+
+    if (error) {
+      console.log("Update profile error:", error.message);
+      return c.json({ error: `Errore: ${error.message}` }, 500);
+    }
+
+    return c.json({ profile: updated });
   } catch (err) {
     console.log("Error in update profile:", err);
     return c.json({ error: `Errore nell'aggiornamento profilo: ${err}` }, 500);
   }
 });
 
-// POST /weight-log — Add a weight log entry
+// ─── WEIGHT LOG ─────────────────────────────────────────────
+
+// POST /weight-log
 app.post("/make-server-48e8ada4/weight-log", async (c) => {
   try {
-    const user = await authenticateUser(c);
-    if (!user.user) {
+    const { user } = await authenticateUser(c);
+    if (!user) {
       return c.json({ error: "Non autorizzato." }, 401);
     }
 
@@ -386,12 +417,6 @@ app.post("/make-server-48e8ada4/weight-log", async (c) => {
       typeof body.weight_kg === "string"
         ? parseFloat(body.weight_kg)
         : body.weight_kg;
-
-    console.log(
-      "weight-log: user:", user.user.id,
-      "raw weight_kg:", body.weight_kg,
-      "parsed:", weight_kg
-    );
 
     if (
       weight_kg === undefined ||
@@ -406,7 +431,7 @@ app.post("/make-server-48e8ada4/weight-log", async (c) => {
     }
 
     // Get profile for height to calculate BMI
-    const profile = await ensureProfile(user.user.id, user.user.email || "");
+    const profile = await ensureProfile(user.id, user.email || "");
     const height_cm = profile?.height_cm;
     let bmi: number | null = null;
     if (height_cm && height_cm > 0) {
@@ -415,24 +440,26 @@ app.post("/make-server-48e8ada4/weight-log", async (c) => {
     }
 
     const timestamp = new Date().toISOString();
-    const logKey = `weight_log:${user.user.id}:${timestamp}`;
     const logEntry = {
-      user_id: user.user.id,
+      user_id: user.id,
       weight_kg,
       bmi,
       logged_at: timestamp,
     };
 
-    await kv.set(logKey, logEntry);
-    console.log("weight-log: Saved entry:", logKey);
+    const { error: logError } = await adminSupabase
+      .from("weight_logs")
+      .insert(logEntry);
+
+    if (logError) {
+      return c.json({ error: `Errore: ${logError.message}` }, 500);
+    }
 
     // Also update current_weight_kg in profile
-    await kv.set(`profile:${user.user.id}`, {
-      ...profile,
-      current_weight_kg: weight_kg,
-      updated_at: timestamp,
-    });
-    console.log("weight-log: Updated profile weight for", user.user.id);
+    await adminSupabase
+      .from("profiles")
+      .update({ current_weight_kg: weight_kg })
+      .eq("id", user.id);
 
     return c.json({ status: "ok", log: logEntry });
   } catch (err) {
@@ -441,31 +468,34 @@ app.post("/make-server-48e8ada4/weight-log", async (c) => {
   }
 });
 
-// GET /weight-logs — Get all weight logs for the current user
+// GET /weight-logs
 app.get("/make-server-48e8ada4/weight-logs", async (c) => {
   try {
-    const user = await authenticateUser(c);
-    if (!user.user) {
+    const { user } = await authenticateUser(c);
+    if (!user) {
       return c.json({ error: "Non autorizzato." }, 401);
     }
 
-    const logs = await kv.getByPrefix(`weight_log:${user.user.id}:`);
-    // Sort by logged_at ascending
-    logs.sort(
-      (a: any, b: any) =>
-        new Date(a.logged_at).getTime() - new Date(b.logged_at).getTime()
-    );
-    console.log("weight-logs: Found", logs.length, "entries for", user.user.id);
-    return c.json({ logs });
+    const { data, error } = await adminSupabase
+      .from("weight_logs")
+      .select("weight_kg, bmi, logged_at")
+      .eq("user_id", user.id)
+      .order("logged_at", { ascending: true });
+
+    if (error) {
+      return c.json({ error: `Errore: ${error.message}` }, 500);
+    }
+
+    return c.json({ logs: data || [] });
   } catch (err) {
     console.log("Error in weight-logs:", err);
     return c.json({ error: `Errore nel recupero log peso: ${err}` }, 500);
   }
 });
 
-// ─── FOOD OVERRIDES ───
+// ─── FOOD OVERRIDES ─────────────────────────────────────────
 
-// GET /food-overrides — Get user's food weight overrides
+// GET /food-overrides
 app.get("/make-server-48e8ada4/food-overrides", async (c) => {
   try {
     const { user, reason } = await authenticateUser(c);
@@ -473,19 +503,33 @@ app.get("/make-server-48e8ada4/food-overrides", async (c) => {
       return c.json({ error: "Non autorizzato.", reason }, 401);
     }
 
-    const overrides = await kv.get(`food_overrides:${user.id}`);
-    return c.json({ overrides: overrides || {} });
+    const { data, error } = await adminSupabase
+      .from("user_food_overrides")
+      .select("meal_category_food_id, custom_weight")
+      .eq("user_id", user.id);
+
+    if (error) {
+      return c.json({ error: `Errore: ${error.message}` }, 500);
+    }
+
+    // Convert to { mcf_id: weight } map for frontend
+    const overrides: Record<string, number> = {};
+    for (const row of data || []) {
+      overrides[row.meal_category_food_id] = row.custom_weight;
+    }
+
+    return c.json({ overrides });
   } catch (err) {
     console.log("Error in food-overrides:", err);
     return c.json({ error: `Errore nel recupero override: ${err}` }, 500);
   }
 });
 
-// PUT /food-overrides — Save/update user's food weight overrides
+// PUT /food-overrides
 app.put("/make-server-48e8ada4/food-overrides", async (c) => {
   try {
-    const user = await authenticateUser(c);
-    if (!user.user) {
+    const { user } = await authenticateUser(c);
+    if (!user) {
       return c.json({ error: "Non autorizzato." }, 401);
     }
 
@@ -494,12 +538,300 @@ app.put("/make-server-48e8ada4/food-overrides", async (c) => {
       return c.json({ error: "Formato override non valido." }, 400);
     }
 
-    await kv.set(`food_overrides:${user.user.id}`, body.overrides);
-    console.log("food-overrides: Saved for", user.user.id);
+    // Delete all existing overrides for this user
+    await adminSupabase
+      .from("user_food_overrides")
+      .delete()
+      .eq("user_id", user.id);
+
+    // Insert new overrides
+    const rows = Object.entries(body.overrides)
+      .filter(([_, v]) => v !== null && v !== undefined)
+      .map(([mcfId, weight]) => ({
+        user_id: user.id,
+        meal_category_food_id: mcfId,
+        custom_weight: weight as number,
+      }));
+
+    if (rows.length > 0) {
+      const { error } = await adminSupabase
+        .from("user_food_overrides")
+        .insert(rows);
+
+      if (error) {
+        console.log("food-overrides insert error:", error.message);
+        return c.json({ error: `Errore: ${error.message}` }, 500);
+      }
+    }
+
     return c.json({ status: "ok", message: "Override salvati." });
   } catch (err) {
     console.log("Error in save food-overrides:", err);
     return c.json({ error: `Errore nel salvataggio override: ${err}` }, 500);
+  }
+});
+
+// ─── MEALS STRUCTURE ────────────────────────────────────────
+
+// GET /meals-structure — Full hierarchy for frontend
+app.get("/make-server-48e8ada4/meals-structure", async (c) => {
+  try {
+    const { user } = await authenticateUser(c);
+    if (!user) {
+      return c.json({ error: "Non autorizzato." }, 401);
+    }
+
+    // Fetch all data in parallel
+    const [mealsRes, mcRes, mcfRes, foodsRes, catsRes] = await Promise.all([
+      adminSupabase.from("meals").select("*").order("sort_order"),
+      adminSupabase.from("meal_categories").select("*").order("sort_order"),
+      adminSupabase.from("meal_category_foods").select("*").order("sort_order"),
+      adminSupabase.from("foods").select("*"),
+      adminSupabase.from("categories").select("*"),
+    ]);
+
+    if (mealsRes.error || mcRes.error || mcfRes.error || foodsRes.error || catsRes.error) {
+      const err = mealsRes.error || mcRes.error || mcfRes.error || foodsRes.error || catsRes.error;
+      return c.json({ error: `Errore: ${err!.message}` }, 500);
+    }
+
+    const foodsMap = new Map((foodsRes.data || []).map((f: any) => [f.id, f]));
+    const catsMap = new Map((catsRes.data || []).map((c: any) => [c.id, c]));
+
+    // Group meal_category_foods by meal_category_id
+    const mcfByMc = new Map<string, any[]>();
+    for (const mcf of mcfRes.data || []) {
+      const list = mcfByMc.get(mcf.meal_category_id) || [];
+      list.push(mcf);
+      mcfByMc.set(mcf.meal_category_id, list);
+    }
+
+    // Group meal_categories by meal_id
+    const mcByMeal = new Map<string, any[]>();
+    for (const mc of mcRes.data || []) {
+      const list = mcByMeal.get(mc.meal_id) || [];
+      list.push(mc);
+      mcByMeal.set(mc.meal_id, list);
+    }
+
+    // Build the hierarchy
+    const meals = (mealsRes.data || []).map((meal: any) => {
+      const mealCategories = mcByMeal.get(meal.id) || [];
+      return {
+        id: meal.slug,
+        name: meal.name,
+        icon: meal.icon,
+        is_free: meal.is_free,
+        categories: mealCategories.map((mc: any) => {
+          const cat = catsMap.get(mc.category_id);
+          const mcfList = mcfByMc.get(mc.id) || [];
+          return {
+            id: mc.id,  // Use meal_category UUID as category id (unique per meal-category pair)
+            name: cat?.name || "",
+            icon: mc.icon_override || cat?.icon || "",
+            is_optional: mc.is_optional,
+            items: mcfList.map((mcf: any) => {
+              const food = foodsMap.get(mcf.food_id);
+              return {
+                id: mcf.id,  // meal_category_food UUID — used as key for overrides
+                food_id: mcf.food_id,
+                name: food?.name || "",
+                baseWeight: mcf.base_weight,
+                note: food?.note || undefined,
+                subGroup: food?.sub_group || undefined,
+                subGroupIcon: food?.sub_group_icon || undefined,
+              };
+            }),
+          };
+        }),
+      };
+    });
+
+    return c.json({ meals });
+  } catch (err) {
+    console.log("Error in meals-structure:", err);
+    return c.json({ error: `Errore nel caricamento struttura pasti: ${err}` }, 500);
+  }
+});
+
+// ─── ADMIN: Invitations ─────────────────────────────────────
+
+// GET /admin/invitations — All invitations with inviter info
+app.get("/make-server-48e8ada4/admin/invitations", requireAdmin, async (c) => {
+  try {
+    const { data, error } = await adminSupabase
+      .from("invitations")
+      .select(`
+        id, email, name, invited_at, accepted_at,
+        inviter:profiles!invitations_invited_by_fkey(id, email, name)
+      `)
+      .order("invited_at", { ascending: false });
+
+    if (error) {
+      return c.json({ error: `Errore: ${error.message}` }, 500);
+    }
+
+    return c.json({ invitations: data || [] });
+  } catch (err) {
+    console.log("Error in admin/invitations:", err);
+    return c.json({ error: `Errore: ${err}` }, 500);
+  }
+});
+
+// ─── ADMIN: Foods CRUD ──────────────────────────────────────
+
+// POST /admin/foods
+app.post("/make-server-48e8ada4/admin/foods", requireAdmin, async (c) => {
+  try {
+    const body = await parseBody(c);
+    if (!body?.name) {
+      return c.json({ error: "Nome alimento richiesto." }, 400);
+    }
+
+    const { data, error } = await adminSupabase
+      .from("foods")
+      .insert({
+        name: body.name,
+        note: body.note || null,
+        sub_group: body.sub_group || null,
+        sub_group_icon: body.sub_group_icon || null,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      return c.json({ error: `Errore: ${error.message}` }, 500);
+    }
+
+    return c.json({ food: data }, 201);
+  } catch (err) {
+    return c.json({ error: `Errore: ${err}` }, 500);
+  }
+});
+
+// PUT /admin/foods/:id
+app.put("/make-server-48e8ada4/admin/foods/:id", requireAdmin, async (c) => {
+  try {
+    const id = c.req.param("id");
+    const body = await parseBody(c);
+    if (!body) {
+      return c.json({ error: "Dati non validi." }, 400);
+    }
+
+    const updates: Record<string, any> = {};
+    if ("name" in body) updates.name = body.name;
+    if ("note" in body) updates.note = body.note;
+    if ("sub_group" in body) updates.sub_group = body.sub_group;
+    if ("sub_group_icon" in body) updates.sub_group_icon = body.sub_group_icon;
+
+    const { data, error } = await adminSupabase
+      .from("foods")
+      .update(updates)
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) {
+      return c.json({ error: `Errore: ${error.message}` }, 500);
+    }
+
+    return c.json({ food: data });
+  } catch (err) {
+    return c.json({ error: `Errore: ${err}` }, 500);
+  }
+});
+
+// DELETE /admin/foods/:id
+app.delete("/make-server-48e8ada4/admin/foods/:id", requireAdmin, async (c) => {
+  try {
+    const id = c.req.param("id");
+    const { error } = await adminSupabase.from("foods").delete().eq("id", id);
+    if (error) {
+      return c.json({ error: `Errore: ${error.message}` }, 500);
+    }
+    return c.json({ status: "ok" });
+  } catch (err) {
+    return c.json({ error: `Errore: ${err}` }, 500);
+  }
+});
+
+// ─── ADMIN: Meal-Category-Foods CRUD ────────────────────────
+
+// POST /admin/meal-category-foods
+app.post("/make-server-48e8ada4/admin/meal-category-foods", requireAdmin, async (c) => {
+  try {
+    const body = await parseBody(c);
+    if (!body?.meal_category_id || !body?.food_id || !body?.base_weight) {
+      return c.json({ error: "meal_category_id, food_id e base_weight richiesti." }, 400);
+    }
+
+    const { data, error } = await adminSupabase
+      .from("meal_category_foods")
+      .insert({
+        meal_category_id: body.meal_category_id,
+        food_id: body.food_id,
+        base_weight: body.base_weight,
+        sort_order: body.sort_order || 0,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      return c.json({ error: `Errore: ${error.message}` }, 500);
+    }
+
+    return c.json({ meal_category_food: data }, 201);
+  } catch (err) {
+    return c.json({ error: `Errore: ${err}` }, 500);
+  }
+});
+
+// PUT /admin/meal-category-foods/:id
+app.put("/make-server-48e8ada4/admin/meal-category-foods/:id", requireAdmin, async (c) => {
+  try {
+    const id = c.req.param("id");
+    const body = await parseBody(c);
+    if (!body) {
+      return c.json({ error: "Dati non validi." }, 400);
+    }
+
+    const updates: Record<string, any> = {};
+    if ("base_weight" in body) updates.base_weight = body.base_weight;
+    if ("sort_order" in body) updates.sort_order = body.sort_order;
+
+    const { data, error } = await adminSupabase
+      .from("meal_category_foods")
+      .update(updates)
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) {
+      return c.json({ error: `Errore: ${error.message}` }, 500);
+    }
+
+    return c.json({ meal_category_food: data });
+  } catch (err) {
+    return c.json({ error: `Errore: ${err}` }, 500);
+  }
+});
+
+// DELETE /admin/meal-category-foods/:id
+app.delete("/make-server-48e8ada4/admin/meal-category-foods/:id", requireAdmin, async (c) => {
+  try {
+    const id = c.req.param("id");
+    const { error } = await adminSupabase
+      .from("meal_category_foods")
+      .delete()
+      .eq("id", id);
+
+    if (error) {
+      return c.json({ error: `Errore: ${error.message}` }, 500);
+    }
+
+    return c.json({ status: "ok" });
+  } catch (err) {
+    return c.json({ error: `Errore: ${err}` }, 500);
   }
 });
 

@@ -1,10 +1,10 @@
 import { useState, useEffect, useCallback } from "react";
 import {
   ShoppingCart, Leaf, RotateCcw, LogOut, Loader2,
-  UtensilsCrossed, User, Settings2,
+  UtensilsCrossed, User, Settings2, Shield, AlertCircle,
 } from "lucide-react";
 import { Toaster } from "sonner";
-import { meals } from "./components/meal-data";
+import { useMealsData } from "./components/use-meals-data";
 import { useMealPlanner } from "./components/use-meal-planner";
 import { FoodGrid } from "./components/food-grid";
 import { CartSidebar } from "./components/cart-sidebar";
@@ -12,17 +12,46 @@ import { AuthProvider, useAuth } from "./components/auth-provider";
 import { LoginScreen } from "./components/login-screen";
 import { ProfilePage } from "./components/profile-page";
 import { FoodOverridesPage, type FoodOverrides } from "./components/food-overrides-page";
+import { AdminPanel } from "./components/admin-panel";
 import { apiFetch } from "./components/supabase-client";
 
-type AppView = "planner" | "profile" | "overrides";
+type AppView = "planner" | "profile" | "overrides" | "admin";
 
 function MealPlannerApp() {
   const [activeView, setActiveView] = useState<AppView>("planner");
-  const [activeMealId, setActiveMealId] = useState(meals[0].id);
   const [mobileCartOpen, setMobileCartOpen] = useState(false);
   const [foodOverrides, setFoodOverrides] = useState<FoodOverrides>({});
   const [loadingOverrides, setLoadingOverrides] = useState(true);
+  const [userRole, setUserRole] = useState<string>("user");
   const { user, signOut } = useAuth();
+
+  // Load meals from database
+  const { meals, loading: mealsLoading, error: mealsError, reload: reloadMeals } = useMealsData();
+  const [activeMealId, setActiveMealId] = useState<string>("");
+
+  // Set first meal as active when meals load
+  useEffect(() => {
+    if (meals.length > 0 && !activeMealId) {
+      setActiveMealId(meals[0].id);
+    }
+  }, [meals, activeMealId]);
+
+  // Load user profile to check role
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await apiFetch("/profile");
+        if (res.ok) {
+          const data = await res.json();
+          if (data.profile?.role) {
+            setUserRole(data.profile.role);
+          }
+        }
+      } catch (err) {
+        console.error("Error loading profile role:", err);
+      }
+    })();
+  }, []);
 
   // Load food overrides on mount
   const loadOverrides = useCallback(async () => {
@@ -35,7 +64,6 @@ function MealPlannerApp() {
         }
       } else {
         console.warn("loadOverrides: non-ok response", res.status);
-        // Single retry after 1.5s (safety net — token should already be valid)
         if (res.status === 401) {
           await new Promise((r) => setTimeout(r, 1500));
           const retryRes = await apiFetch("/food-overrides");
@@ -44,8 +72,6 @@ function MealPlannerApp() {
             if (data.overrides) {
               setFoodOverrides(data.overrides);
             }
-          } else {
-            console.error("loadOverrides: retry also failed", retryRes.status);
           }
         }
       }
@@ -72,9 +98,9 @@ function MealPlannerApp() {
     hasSelections,
     allMealsComplete,
     getIncompleteMeals,
-  } = useMealPlanner(foodOverrides);
+  } = useMealPlanner(meals, foodOverrides);
 
-  const activeMeal = meals.find((m) => m.id === activeMealId)!;
+  const activeMeal = meals.find((m) => m.id === activeMealId);
   const cartItemCount = selections.reduce(
     (total, m) => total + m.categories.reduce((s, c) => s + c.foods.length, 0),
     0
@@ -83,7 +109,9 @@ function MealPlannerApp() {
   const displayName =
     user?.user_metadata?.name || user?.email?.split("@")[0] || "Utente";
 
-  const navItems: { id: AppView; label: string; icon: React.ReactNode; mobileLabel: string }[] = [
+  const isAdmin = userRole === "admin";
+
+  const navItems: { id: AppView; label: string; icon: React.ReactNode; mobileLabel: string; adminOnly?: boolean }[] = [
     {
       id: "planner",
       label: "Piano Pasti",
@@ -102,7 +130,46 @@ function MealPlannerApp() {
       mobileLabel: "Profilo",
       icon: <User className="w-4 h-4" />,
     },
+    ...(isAdmin
+      ? [
+          {
+            id: "admin" as AppView,
+            label: "Admin",
+            mobileLabel: "Admin",
+            icon: <Shield className="w-4 h-4" />,
+          },
+        ]
+      : []),
   ];
+
+  // Show loading while meals are being fetched
+  if (mealsLoading) {
+    return (
+      <div className="size-full flex items-center justify-center bg-[#f5faf7]">
+        <div className="flex flex-col items-center gap-3">
+          <Loader2 className="w-6 h-6 text-[#52b788] animate-spin" />
+          <p className="text-sm text-[#95d5b2]">Caricamento piano pasti...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (mealsError) {
+    return (
+      <div className="size-full flex items-center justify-center bg-[#f5faf7]">
+        <div className="flex flex-col items-center gap-3 text-center px-6">
+          <AlertCircle className="w-8 h-8 text-red-400" />
+          <p className="text-sm text-red-500">{mealsError}</p>
+          <button
+            onClick={reloadMeals}
+            className="px-4 py-2 bg-[#40916c] text-white rounded-xl text-sm hover:bg-[#2d6a4f] transition-colors cursor-pointer"
+          >
+            Riprova
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="size-full flex flex-col bg-[#f5faf7]">
@@ -149,6 +216,11 @@ function MealPlannerApp() {
                 {displayName.charAt(0).toUpperCase()}
               </div>
               <span className="text-sm text-[#555] max-w-[100px] truncate">{displayName}</span>
+              {isAdmin && (
+                <span className="text-[10px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-medium">
+                  Admin
+                </span>
+              )}
             </div>
 
             {activeView === "planner" && hasSelections && (
@@ -189,7 +261,7 @@ function MealPlannerApp() {
 
       {/* Main Content */}
       <div className="flex-1 flex overflow-hidden">
-        {activeView === "planner" && (
+        {activeView === "planner" && activeMeal && (
           <>
             {/* Left panel */}
             <div className="flex-1 flex flex-col overflow-hidden">
@@ -282,9 +354,16 @@ function MealPlannerApp() {
         {activeView === "overrides" && (
           <div className="flex-1 overflow-y-auto px-4 lg:px-6 py-6">
             <FoodOverridesPage
+              meals={meals}
               overrides={foodOverrides}
               onOverridesChange={setFoodOverrides}
             />
+          </div>
+        )}
+
+        {activeView === "admin" && isAdmin && (
+          <div className="flex-1 overflow-y-auto px-4 lg:px-6 py-6">
+            <AdminPanel onMealsChanged={reloadMeals} />
           </div>
         )}
       </div>

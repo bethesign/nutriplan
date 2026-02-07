@@ -1,0 +1,873 @@
+import { useState, useEffect, useCallback } from "react";
+import {
+  Shield, Users, UtensilsCrossed, Package,
+  Search, Plus, Pencil, Trash2, Save, X, Loader2,
+  AlertCircle, CheckCircle2, ChevronDown, ChevronRight,
+  Mail, UserCheck, Clock,
+} from "lucide-react";
+import { toast } from "sonner";
+import { apiFetch } from "./supabase-client";
+import type { Meal } from "./types";
+import { format } from "date-fns";
+import { it } from "date-fns/locale";
+
+type AdminTab = "foods" | "assignments" | "invitations";
+
+interface AdminPanelProps {
+  onMealsChanged: () => Promise<void>;
+}
+
+// ─── Types ────────────────────────────────────────────────────
+
+interface FoodRecord {
+  id: string;
+  name: string;
+  note: string | null;
+  sub_group: string | null;
+  sub_group_icon: string | null;
+}
+
+interface Invitation {
+  id: string;
+  email: string;
+  name: string | null;
+  invited_at: string;
+  accepted_at: string | null;
+  inviter: { id: string; email: string; name: string } | null;
+}
+
+// ─── Main Admin Panel ─────────────────────────────────────────
+
+export function AdminPanel({ onMealsChanged }: AdminPanelProps) {
+  const [activeTab, setActiveTab] = useState<AdminTab>("foods");
+
+  const tabs: { id: AdminTab; label: string; icon: React.ReactNode }[] = [
+    { id: "foods", label: "Alimenti", icon: <Package className="w-4 h-4" /> },
+    { id: "assignments", label: "Assegnazioni", icon: <UtensilsCrossed className="w-4 h-4" /> },
+    { id: "invitations", label: "Inviti", icon: <Users className="w-4 h-4" /> },
+  ];
+
+  return (
+    <div className="max-w-5xl mx-auto space-y-5">
+      {/* Header */}
+      <div className="flex items-center gap-4">
+        <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center shadow-md">
+          <Shield className="w-7 h-7 text-white" />
+        </div>
+        <div>
+          <h2 className="text-xl font-semibold text-[#1b4332]">Pannello Admin</h2>
+          <p className="text-sm text-[#95d5b2]">Gestione alimenti, assegnazioni e inviti</p>
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div className="flex gap-1 bg-white rounded-xl p-1 border border-[#e8f5e9] shadow-sm">
+        {tabs.map((tab) => (
+          <button
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            className={`
+              flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm transition-all cursor-pointer
+              ${activeTab === tab.id
+                ? "bg-[#d8f3dc] text-[#1b4332] font-medium shadow-sm"
+                : "text-[#888] hover:text-[#555] hover:bg-[#f5f5f5]"
+              }
+            `}
+          >
+            {tab.icon}
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Tab Content */}
+      {activeTab === "foods" && <FoodsTab onMealsChanged={onMealsChanged} />}
+      {activeTab === "assignments" && <AssignmentsTab onMealsChanged={onMealsChanged} />}
+      {activeTab === "invitations" && <InvitationsTab />}
+    </div>
+  );
+}
+
+// ─── Foods Tab ────────────────────────────────────────────────
+
+function FoodsTab({ onMealsChanged }: { onMealsChanged: () => Promise<void> }) {
+  const [meals, setMeals] = useState<Meal[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
+  const [editingFood, setEditingFood] = useState<FoodRecord | null>(null);
+  const [showCreateForm, setShowCreateForm] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  // Form state
+  const [formName, setFormName] = useState("");
+  const [formNote, setFormNote] = useState("");
+  const [formSubGroup, setFormSubGroup] = useState("");
+  const [formSubGroupIcon, setFormSubGroupIcon] = useState("");
+
+  const loadMeals = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await apiFetch("/meals-structure");
+      if (res.ok) {
+        const data = await res.json();
+        setMeals(data.meals || []);
+      }
+    } catch (err) {
+      console.error("Error loading meals:", err);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadMeals();
+  }, [loadMeals]);
+
+  // Extract unique foods from meals structure
+  const allFoods: FoodRecord[] = [];
+  const seenFoodIds = new Set<string>();
+  meals.forEach((meal) => {
+    meal.categories.forEach((cat) => {
+      cat.items.forEach((item) => {
+        const foodId = item.food_id || item.id;
+        if (!seenFoodIds.has(foodId)) {
+          seenFoodIds.add(foodId);
+          allFoods.push({
+            id: foodId,
+            name: item.name,
+            note: item.note || null,
+            sub_group: item.subGroup || null,
+            sub_group_icon: item.subGroupIcon || null,
+          });
+        }
+      });
+    });
+  });
+  allFoods.sort((a, b) => a.name.localeCompare(b.name, "it"));
+
+  const searchLower = search.toLowerCase().trim();
+  const filteredFoods = searchLower
+    ? allFoods.filter((f) => f.name.toLowerCase().includes(searchLower))
+    : allFoods;
+
+  const resetForm = () => {
+    setFormName("");
+    setFormNote("");
+    setFormSubGroup("");
+    setFormSubGroupIcon("");
+  };
+
+  const startEdit = (food: FoodRecord) => {
+    setEditingFood(food);
+    setFormName(food.name);
+    setFormNote(food.note || "");
+    setFormSubGroup(food.sub_group || "");
+    setFormSubGroupIcon(food.sub_group_icon || "");
+    setShowCreateForm(false);
+  };
+
+  const startCreate = () => {
+    setEditingFood(null);
+    resetForm();
+    setShowCreateForm(true);
+  };
+
+  const cancelForm = () => {
+    setEditingFood(null);
+    setShowCreateForm(false);
+    resetForm();
+  };
+
+  const handleSave = async () => {
+    if (!formName.trim()) {
+      toast.error("Il nome dell'alimento e' obbligatorio.");
+      return;
+    }
+    setSaving(true);
+    try {
+      const payload = {
+        name: formName.trim(),
+        note: formNote.trim() || null,
+        sub_group: formSubGroup.trim() || null,
+        sub_group_icon: formSubGroupIcon.trim() || null,
+      };
+
+      let res: Response;
+      if (editingFood) {
+        res = await apiFetch(`/admin/foods/${editingFood.id}`, {
+          method: "PUT",
+          body: JSON.stringify(payload),
+        });
+      } else {
+        res = await apiFetch("/admin/foods", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+      }
+
+      const data = await res.json();
+      if (data.error) {
+        toast.error(data.error);
+      } else {
+        toast.success(editingFood ? "Alimento aggiornato!" : "Alimento creato!");
+        cancelForm();
+        await loadMeals();
+        await onMealsChanged();
+      }
+    } catch (err) {
+      console.error("Save food error:", err);
+      toast.error("Errore nel salvataggio");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDelete = async (food: FoodRecord) => {
+    if (!confirm(`Eliminare "${food.name}"? Verranno rimosse anche tutte le assegnazioni.`)) return;
+    setDeletingId(food.id);
+    try {
+      const res = await apiFetch(`/admin/foods/${food.id}`, { method: "DELETE" });
+      const data = await res.json();
+      if (data.error) {
+        toast.error(data.error);
+      } else {
+        toast.success(`"${food.name}" eliminato.`);
+        await loadMeals();
+        await onMealsChanged();
+      }
+    } catch (err) {
+      console.error("Delete food error:", err);
+      toast.error("Errore nell'eliminazione");
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <Loader2 className="w-6 h-6 text-[#52b788] animate-spin" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Toolbar */}
+      <div className="bg-white rounded-2xl border border-[#e8f5e9] shadow-sm p-4">
+        <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3">
+          <div className="relative flex-1 w-full">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[#95d5b2]" />
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Cerca alimento..."
+              className="w-full pl-9 pr-3 py-2.5 rounded-xl border border-[#e0e0e0] bg-[#fafafa] text-[#333] placeholder:text-[#bbb] focus:outline-none focus:border-[#52b788] focus:bg-white transition-all text-sm"
+            />
+          </div>
+          <div className="flex items-center gap-2 flex-shrink-0">
+            <span className="text-xs text-[#999]">{allFoods.length} alimenti</span>
+            <button
+              onClick={startCreate}
+              className="flex items-center gap-1.5 px-4 py-2 bg-[#40916c] hover:bg-[#2d6a4f] text-white rounded-xl text-sm font-medium transition-colors cursor-pointer"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              Nuovo
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Create/Edit Form */}
+      {(showCreateForm || editingFood) && (
+        <div className="bg-white rounded-2xl border border-[#e8f5e9] shadow-sm overflow-hidden">
+          <div className="px-5 py-3 border-b border-[#e8f5e9] bg-[#f8fdf9] flex items-center justify-between">
+            <span className="text-sm font-medium text-[#2d6a4f]">
+              {editingFood ? `Modifica: ${editingFood.name}` : "Nuovo alimento"}
+            </span>
+            <button onClick={cancelForm} className="p-1 text-[#999] hover:text-[#555] cursor-pointer">
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+          <div className="p-5 space-y-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs text-[#888] mb-1">Nome *</label>
+                <input
+                  type="text"
+                  value={formName}
+                  onChange={(e) => setFormName(e.target.value)}
+                  placeholder="es. Pasta integrale"
+                  className="w-full px-3 py-2 rounded-lg border border-[#e0e0e0] bg-[#fafafa] text-sm text-[#333] focus:outline-none focus:border-[#52b788] transition-all"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-[#888] mb-1">Nota</label>
+                <input
+                  type="text"
+                  value={formNote}
+                  onChange={(e) => setFormNote(e.target.value)}
+                  placeholder="es. (1/7)"
+                  className="w-full px-3 py-2 rounded-lg border border-[#e0e0e0] bg-[#fafafa] text-sm text-[#333] focus:outline-none focus:border-[#52b788] transition-all"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-[#888] mb-1">Sotto-gruppo</label>
+                <input
+                  type="text"
+                  value={formSubGroup}
+                  onChange={(e) => setFormSubGroup(e.target.value)}
+                  placeholder="es. Proteine Animali"
+                  className="w-full px-3 py-2 rounded-lg border border-[#e0e0e0] bg-[#fafafa] text-sm text-[#333] focus:outline-none focus:border-[#52b788] transition-all"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-[#888] mb-1">Icona sotto-gruppo</label>
+                <input
+                  type="text"
+                  value={formSubGroupIcon}
+                  onChange={(e) => setFormSubGroupIcon(e.target.value)}
+                  placeholder="es. 🐟"
+                  className="w-full px-3 py-2 rounded-lg border border-[#e0e0e0] bg-[#fafafa] text-sm text-[#333] focus:outline-none focus:border-[#52b788] transition-all"
+                />
+              </div>
+            </div>
+            <div className="flex gap-2 pt-1">
+              <button
+                onClick={handleSave}
+                disabled={saving}
+                className="flex items-center gap-1.5 px-4 py-2 bg-[#40916c] hover:bg-[#2d6a4f] disabled:bg-[#c5d8ce] text-white rounded-xl text-sm font-medium transition-colors cursor-pointer disabled:cursor-not-allowed"
+              >
+                {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+                {editingFood ? "Salva modifiche" : "Crea alimento"}
+              </button>
+              <button
+                onClick={cancelForm}
+                className="px-4 py-2 text-[#999] hover:text-[#555] text-sm rounded-xl hover:bg-[#f5f5f5] transition-colors cursor-pointer"
+              >
+                Annulla
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Foods list */}
+      <div className="bg-white rounded-2xl border border-[#e8f5e9] shadow-sm overflow-hidden">
+        <div className="divide-y divide-[#f0f0f0]">
+          {filteredFoods.length === 0 && (
+            <div className="px-5 py-8 text-center text-sm text-[#999]">
+              {searchLower ? "Nessun alimento trovato" : "Nessun alimento disponibile"}
+            </div>
+          )}
+          {filteredFoods.map((food) => (
+            <div
+              key={food.id}
+              className="flex items-center gap-3 px-5 py-3 hover:bg-[#fafcfa] transition-colors group"
+            >
+              <div className="flex-1 min-w-0">
+                <span className="text-sm text-[#333] font-medium block truncate">{food.name}</span>
+                <div className="flex items-center gap-2 mt-0.5">
+                  {food.note && (
+                    <span className="text-[10px] text-[#999] bg-[#f5f5f5] px-1.5 py-0.5 rounded">
+                      {food.note}
+                    </span>
+                  )}
+                  {food.sub_group && (
+                    <span className="text-[10px] text-[#6c63ff] bg-[#6c63ff]/10 px-1.5 py-0.5 rounded">
+                      {food.sub_group_icon} {food.sub_group}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                <button
+                  onClick={() => startEdit(food)}
+                  className="p-1.5 rounded-lg text-[#999] hover:text-[#52b788] hover:bg-[#d8f3dc] transition-colors cursor-pointer"
+                  title="Modifica"
+                >
+                  <Pencil className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  onClick={() => handleDelete(food)}
+                  disabled={deletingId === food.id}
+                  className="p-1.5 rounded-lg text-[#999] hover:text-red-500 hover:bg-red-50 transition-colors cursor-pointer disabled:opacity-50"
+                  title="Elimina"
+                >
+                  {deletingId === food.id ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Trash2 className="w-3.5 h-3.5" />
+                  )}
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Assignments Tab ──────────────────────────────────────────
+
+function AssignmentsTab({ onMealsChanged }: { onMealsChanged: () => Promise<void> }) {
+  const [meals, setMeals] = useState<Meal[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [expandedMeals, setExpandedMeals] = useState<Set<string>>(new Set());
+  const [expandedCats, setExpandedCats] = useState<Set<string>>(new Set());
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editWeight, setEditWeight] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  // Create assignment form
+  const [showAddForm, setShowAddForm] = useState<string | null>(null); // meal_category_id
+  const [addFoodSearch, setAddFoodSearch] = useState("");
+  const [addFoodId, setAddFoodId] = useState("");
+  const [addWeight, setAddWeight] = useState("");
+
+  const loadMeals = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await apiFetch("/meals-structure");
+      if (res.ok) {
+        const data = await res.json();
+        setMeals(data.meals || []);
+      }
+    } catch (err) {
+      console.error("Error loading meals:", err);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadMeals();
+  }, [loadMeals]);
+
+  // Extract all unique foods for the add-food dropdown
+  const allFoods: { id: string; name: string }[] = [];
+  const seenIds = new Set<string>();
+  meals.forEach((m) =>
+    m.categories.forEach((c) =>
+      c.items.forEach((item) => {
+        const fid = item.food_id || item.id;
+        if (!seenIds.has(fid)) {
+          seenIds.add(fid);
+          allFoods.push({ id: fid, name: item.name });
+        }
+      })
+    )
+  );
+  allFoods.sort((a, b) => a.name.localeCompare(b.name, "it"));
+
+  const toggleMeal = (id: string) => {
+    setExpandedMeals((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  };
+
+  const toggleCat = (id: string) => {
+    setExpandedCats((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  };
+
+  const handleUpdateWeight = async (mcfId: string) => {
+    const weight = parseFloat(editWeight);
+    if (isNaN(weight) || weight <= 0) {
+      toast.error("Peso non valido");
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await apiFetch(`/admin/meal-category-foods/${mcfId}`, {
+        method: "PUT",
+        body: JSON.stringify({ base_weight: weight }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        toast.error(data.error);
+      } else {
+        toast.success("Peso aggiornato!");
+        setEditingId(null);
+        await loadMeals();
+        await onMealsChanged();
+      }
+    } catch (err) {
+      toast.error("Errore nell'aggiornamento");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDeleteAssignment = async (mcfId: string, foodName: string) => {
+    if (!confirm(`Rimuovere "${foodName}" da questa categoria?`)) return;
+    setDeletingId(mcfId);
+    try {
+      const res = await apiFetch(`/admin/meal-category-foods/${mcfId}`, { method: "DELETE" });
+      const data = await res.json();
+      if (data.error) {
+        toast.error(data.error);
+      } else {
+        toast.success("Assegnazione rimossa!");
+        await loadMeals();
+        await onMealsChanged();
+      }
+    } catch (err) {
+      toast.error("Errore nella rimozione");
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  const handleAddAssignment = async (mealCategoryId: string) => {
+    if (!addFoodId || !addWeight) {
+      toast.error("Seleziona un alimento e un peso.");
+      return;
+    }
+    const weight = parseFloat(addWeight);
+    if (isNaN(weight) || weight <= 0) {
+      toast.error("Peso non valido");
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await apiFetch("/admin/meal-category-foods", {
+        method: "POST",
+        body: JSON.stringify({
+          meal_category_id: mealCategoryId,
+          food_id: addFoodId,
+          base_weight: weight,
+          sort_order: 99,
+        }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        toast.error(data.error);
+      } else {
+        toast.success("Alimento assegnato!");
+        setShowAddForm(null);
+        setAddFoodSearch("");
+        setAddFoodId("");
+        setAddWeight("");
+        await loadMeals();
+        await onMealsChanged();
+      }
+    } catch (err) {
+      toast.error("Errore nell'assegnazione");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <Loader2 className="w-6 h-6 text-[#52b788] animate-spin" />
+      </div>
+    );
+  }
+
+  const filteredAddFoods = addFoodSearch.trim()
+    ? allFoods.filter((f) => f.name.toLowerCase().includes(addFoodSearch.toLowerCase()))
+    : allFoods;
+
+  return (
+    <div className="space-y-3">
+      <div className="bg-white rounded-2xl border border-[#e8f5e9] shadow-sm p-4">
+        <p className="text-sm text-[#888]">
+          Gestisci le assegnazioni degli alimenti ai pasti. Ogni alimento puo' apparire in piu' pasti con pesi diversi.
+        </p>
+      </div>
+
+      {meals.map((meal) => {
+        const mealExpanded = expandedMeals.has(meal.id);
+        const totalItems = meal.categories.reduce((s, c) => s + c.items.length, 0);
+
+        return (
+          <div key={meal.id} className="bg-white rounded-2xl border border-[#e8f5e9] shadow-sm overflow-hidden">
+            <button
+              onClick={() => toggleMeal(meal.id)}
+              className="w-full flex items-center justify-between px-5 py-3.5 hover:bg-[#f8fdf9] transition-colors cursor-pointer"
+            >
+              <div className="flex items-center gap-2.5">
+                {mealExpanded ? <ChevronDown className="w-4 h-4 text-[#95d5b2]" /> : <ChevronRight className="w-4 h-4 text-[#95d5b2]" />}
+                <span className="text-lg">{meal.icon}</span>
+                <span className="font-medium text-[#1b4332]">{meal.name}</span>
+                {meal.is_free && (
+                  <span className="text-[10px] bg-blue-50 text-blue-600 px-1.5 py-0.5 rounded-full">libero</span>
+                )}
+              </div>
+              <span className="text-xs text-[#bbb]">{totalItems} alimenti</span>
+            </button>
+
+            {mealExpanded && (
+              <div className="border-t border-[#e8f5e9]">
+                {meal.categories.map((cat) => {
+                  const catKey = `${meal.id}:${cat.id}`;
+                  const catExpanded = expandedCats.has(catKey);
+
+                  return (
+                    <div key={cat.id}>
+                      <button
+                        onClick={() => toggleCat(catKey)}
+                        className="w-full flex items-center justify-between px-7 py-2.5 hover:bg-[#fafcfa] transition-colors cursor-pointer"
+                      >
+                        <div className="flex items-center gap-2">
+                          {catExpanded ? <ChevronDown className="w-3.5 h-3.5 text-[#ccc]" /> : <ChevronRight className="w-3.5 h-3.5 text-[#ccc]" />}
+                          <span>{cat.icon}</span>
+                          <span className="text-sm text-[#555]">{cat.name}</span>
+                          {cat.is_optional && (
+                            <span className="text-[9px] bg-gray-100 text-gray-500 px-1 py-0.5 rounded">opzionale</span>
+                          )}
+                        </div>
+                        <span className="text-xs text-[#ccc]">{cat.items.length}</span>
+                      </button>
+
+                      {catExpanded && (
+                        <div className="divide-y divide-[#f5f5f5]">
+                          {cat.items.map((item) => (
+                            <div key={item.id} className="flex items-center gap-3 px-10 py-2.5 hover:bg-[#fafcfa] transition-colors group">
+                              <div className="flex-1 min-w-0">
+                                <span className="text-sm text-[#555] block truncate">{item.name}</span>
+                                {item.note && <span className="text-[10px] text-[#bbb]">{item.note}</span>}
+                              </div>
+
+                              {editingId === item.id ? (
+                                <div className="flex items-center gap-2">
+                                  <input
+                                    type="number"
+                                    min={1}
+                                    value={editWeight}
+                                    onChange={(e) => setEditWeight(e.target.value)}
+                                    className="w-20 text-right text-sm rounded-lg border border-[#52b788] px-2 py-1 focus:outline-none bg-white"
+                                    autoFocus
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Enter") handleUpdateWeight(item.id);
+                                      if (e.key === "Escape") setEditingId(null);
+                                    }}
+                                  />
+                                  <span className="text-xs text-[#999]">g</span>
+                                  <button
+                                    onClick={() => handleUpdateWeight(item.id)}
+                                    disabled={saving}
+                                    className="p-1 text-[#52b788] hover:text-[#2d6a4f] cursor-pointer"
+                                  >
+                                    {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+                                  </button>
+                                  <button onClick={() => setEditingId(null)} className="p-1 text-[#999] hover:text-[#555] cursor-pointer">
+                                    <X className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                              ) : (
+                                <div className="flex items-center gap-2">
+                                  <span className="text-sm text-[#888]">{item.baseWeight}g</span>
+                                  <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                                    <button
+                                      onClick={() => { setEditingId(item.id); setEditWeight(String(item.baseWeight)); }}
+                                      className="p-1 text-[#ccc] hover:text-[#52b788] cursor-pointer"
+                                      title="Modifica peso"
+                                    >
+                                      <Pencil className="w-3 h-3" />
+                                    </button>
+                                    <button
+                                      onClick={() => handleDeleteAssignment(item.id, item.name)}
+                                      disabled={deletingId === item.id}
+                                      className="p-1 text-[#ccc] hover:text-red-500 cursor-pointer disabled:opacity-50"
+                                      title="Rimuovi"
+                                    >
+                                      {deletingId === item.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          ))}
+
+                          {/* Add food to this category */}
+                          {showAddForm === cat.id ? (
+                            <div className="px-10 py-3 bg-[#f8fdf9] space-y-2">
+                              <div className="flex flex-col sm:flex-row gap-2">
+                                <div className="flex-1 relative">
+                                  <input
+                                    type="text"
+                                    value={addFoodSearch}
+                                    onChange={(e) => { setAddFoodSearch(e.target.value); setAddFoodId(""); }}
+                                    placeholder="Cerca alimento..."
+                                    className="w-full px-3 py-1.5 rounded-lg border border-[#e0e0e0] bg-white text-sm text-[#333] focus:outline-none focus:border-[#52b788] transition-all"
+                                  />
+                                  {addFoodSearch && !addFoodId && (
+                                    <div className="absolute top-full left-0 right-0 mt-1 bg-white border border-[#e0e0e0] rounded-lg shadow-lg max-h-40 overflow-y-auto z-10">
+                                      {filteredAddFoods.slice(0, 10).map((f) => (
+                                        <button
+                                          key={f.id}
+                                          onClick={() => { setAddFoodId(f.id); setAddFoodSearch(f.name); }}
+                                          className="w-full text-left px-3 py-1.5 text-sm hover:bg-[#d8f3dc] cursor-pointer"
+                                        >
+                                          {f.name}
+                                        </button>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                                <input
+                                  type="number"
+                                  min={1}
+                                  value={addWeight}
+                                  onChange={(e) => setAddWeight(e.target.value)}
+                                  placeholder="Peso (g)"
+                                  className="w-24 px-3 py-1.5 rounded-lg border border-[#e0e0e0] bg-white text-sm text-[#333] focus:outline-none focus:border-[#52b788] transition-all"
+                                />
+                              </div>
+                              <div className="flex gap-2">
+                                <button
+                                  onClick={() => handleAddAssignment(cat.id)}
+                                  disabled={saving || !addFoodId}
+                                  className="flex items-center gap-1 px-3 py-1.5 bg-[#40916c] hover:bg-[#2d6a4f] disabled:bg-[#c5d8ce] text-white rounded-lg text-xs font-medium cursor-pointer disabled:cursor-not-allowed transition-colors"
+                                >
+                                  {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Plus className="w-3 h-3" />}
+                                  Aggiungi
+                                </button>
+                                <button
+                                  onClick={() => { setShowAddForm(null); setAddFoodSearch(""); setAddFoodId(""); setAddWeight(""); }}
+                                  className="px-3 py-1.5 text-[#999] hover:text-[#555] text-xs rounded-lg hover:bg-white cursor-pointer transition-colors"
+                                >
+                                  Annulla
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <button
+                              onClick={() => setShowAddForm(cat.id)}
+                              className="w-full flex items-center gap-1.5 px-10 py-2 text-xs text-[#95d5b2] hover:text-[#52b788] hover:bg-[#f8fdf9] transition-colors cursor-pointer"
+                            >
+                              <Plus className="w-3 h-3" />
+                              Aggiungi alimento
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Invitations Tab ──────────────────────────────────────────
+
+function InvitationsTab() {
+  const [invitations, setInvitations] = useState<Invitation[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await apiFetch("/admin/invitations");
+        if (res.ok) {
+          const data = await res.json();
+          setInvitations(data.invitations || []);
+        }
+      } catch (err) {
+        console.error("Error loading invitations:", err);
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <Loader2 className="w-6 h-6 text-[#52b788] animate-spin" />
+      </div>
+    );
+  }
+
+  const accepted = invitations.filter((i) => i.accepted_at);
+  const pending = invitations.filter((i) => !i.accepted_at);
+
+  return (
+    <div className="space-y-4">
+      {/* Stats */}
+      <div className="grid grid-cols-3 gap-3">
+        <div className="bg-white rounded-2xl border border-[#e8f5e9] shadow-sm p-4 text-center">
+          <div className="text-2xl font-bold text-[#1b4332]">{invitations.length}</div>
+          <div className="text-xs text-[#95d5b2] mt-0.5">Totali</div>
+        </div>
+        <div className="bg-white rounded-2xl border border-[#e8f5e9] shadow-sm p-4 text-center">
+          <div className="text-2xl font-bold text-green-600">{accepted.length}</div>
+          <div className="text-xs text-[#95d5b2] mt-0.5">Registrati</div>
+        </div>
+        <div className="bg-white rounded-2xl border border-[#e8f5e9] shadow-sm p-4 text-center">
+          <div className="text-2xl font-bold text-amber-600">{pending.length}</div>
+          <div className="text-xs text-[#95d5b2] mt-0.5">In attesa</div>
+        </div>
+      </div>
+
+      {/* Invitations list */}
+      <div className="bg-white rounded-2xl border border-[#e8f5e9] shadow-sm overflow-hidden">
+        <div className="px-5 py-3 border-b border-[#e8f5e9] bg-[#f8fdf9]">
+          <span className="text-sm font-medium text-[#2d6a4f]">Tutti gli inviti</span>
+        </div>
+        <div className="divide-y divide-[#f0f0f0]">
+          {invitations.length === 0 && (
+            <div className="px-5 py-8 text-center text-sm text-[#999]">
+              <AlertCircle className="w-5 h-5 mx-auto mb-2 text-[#ccc]" />
+              Nessun invito presente
+            </div>
+          )}
+          {invitations.map((inv) => (
+            <div key={inv.id} className="flex items-center gap-3 px-5 py-3 hover:bg-[#fafcfa] transition-colors">
+              <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${
+                inv.accepted_at ? "bg-green-50" : "bg-amber-50"
+              }`}>
+                {inv.accepted_at ? (
+                  <UserCheck className="w-4 h-4 text-green-500" />
+                ) : (
+                  <Clock className="w-4 h-4 text-amber-500" />
+                )}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-medium text-[#333] truncate">{inv.email}</span>
+                  {inv.accepted_at && (
+                    <span className="text-[9px] bg-green-50 text-green-600 px-1.5 py-0.5 rounded-full">registrato</span>
+                  )}
+                </div>
+                <div className="flex items-center gap-2 mt-0.5">
+                  {inv.name && <span className="text-xs text-[#999]">{inv.name}</span>}
+                  <span className="text-[10px] text-[#ccc]">
+                    invitato {(() => {
+                      try {
+                        return format(new Date(inv.invited_at), "dd MMM yyyy", { locale: it });
+                      } catch { return ""; }
+                    })()}
+                  </span>
+                  {inv.inviter && (
+                    <span className="text-[10px] text-[#bbb]">
+                      da {inv.inviter.name || inv.inviter.email}
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}

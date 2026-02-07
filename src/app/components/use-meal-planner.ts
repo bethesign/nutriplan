@@ -1,6 +1,5 @@
-import { useState, useCallback } from "react";
-import type { MealSelection, SelectedFood, CategorySelection } from "./types";
-import { meals } from "./meal-data";
+import { useState, useCallback, useEffect, useRef } from "react";
+import type { Meal, MealSelection, SelectedFood, CategorySelection } from "./types";
 import type { FoodOverrides } from "./food-overrides-page";
 
 // Helper: get effective base weight considering overrides
@@ -8,14 +7,24 @@ function getEffectiveWeight(foodId: string, defaultWeight: number, overrides: Fo
   return overrides[foodId] !== undefined ? overrides[foodId] : defaultWeight;
 }
 
-export function useMealPlanner(overrides: FoodOverrides = {}) {
-  const [selections, setSelections] = useState<MealSelection[]>(
-    meals.map((meal) => ({
-      mealId: meal.id,
-      mealName: meal.name,
-      categories: [],
-    }))
-  );
+export function useMealPlanner(meals: Meal[], overrides: FoodOverrides = {}) {
+  const [selections, setSelections] = useState<MealSelection[]>([]);
+  const prevMealsRef = useRef<string>("");
+
+  // Re-initialize selections when meals change
+  useEffect(() => {
+    const mealsKey = meals.map((m) => m.id).join(",");
+    if (mealsKey !== prevMealsRef.current) {
+      prevMealsRef.current = mealsKey;
+      setSelections(
+        meals.map((meal) => ({
+          mealId: meal.id,
+          mealName: meal.name,
+          categories: [],
+        }))
+      );
+    }
+  }, [meals]);
 
   const toggleFood = useCallback(
     (mealId: string, categoryId: string, categoryName: string, foodId: string, foodName: string, baseWeight: number, note?: string) => {
@@ -225,15 +234,7 @@ export function useMealPlanner(overrides: FoodOverrides = {}) {
 
   const hasSelections = selections.some((m) => m.categories.length > 0);
 
-  // ─── Validation rules ───
-  // Meals where all categories are free (no mandatory selections)
-  const FREE_MEALS = new Set(["spuntino-mattina", "merenda"]);
-
-  // Categories that are always optional (condimenti)
-  const OPTIONAL_CATEGORIES = new Set([
-    "col-condimenti", "pr-condimenti", "ce-condimenti",
-  ]);
-
+  // ─── Validation rules (now dynamic from meals data) ───
   // Helper: check whether a category has at least one food selected
   const catHasFood = (mealSel: typeof selections[number], catId: string) =>
     mealSel.categories.some((cs) => cs.categoryId === catId && cs.foods.length > 0);
@@ -243,15 +244,15 @@ export function useMealPlanner(overrides: FoodOverrides = {}) {
     if (!hasSelections) return false;
     const activeMealSelections = selections.filter((m) => m.categories.length > 0);
     return activeMealSelections.every((mealSel) => {
-      // Free meals are always valid
-      if (FREE_MEALS.has(mealSel.mealId)) return true;
-
       const mealDef = meals.find((m) => m.id === mealSel.mealId);
       if (!mealDef) return false;
 
+      // Free meals are always valid
+      if (mealDef.is_free) return true;
+
       // Every non-optional category must have at least one food selected
       return mealDef.categories
-        .filter((cat) => !OPTIONAL_CATEGORIES.has(cat.id))
+        .filter((cat) => !cat.is_optional)
         .every((cat) => catHasFood(mealSel, cat.id));
     });
   })();
@@ -261,14 +262,15 @@ export function useMealPlanner(overrides: FoodOverrides = {}) {
     const incomplete: { mealName: string; missingCategories: string[] }[] = [];
     selections.forEach((mealSel) => {
       if (mealSel.categories.length === 0) return;
-      // Free meals never report missing categories
-      if (FREE_MEALS.has(mealSel.mealId)) return;
 
       const mealDef = meals.find((m) => m.id === mealSel.mealId);
       if (!mealDef) return;
 
+      // Free meals never report missing categories
+      if (mealDef.is_free) return;
+
       const missing = mealDef.categories
-        .filter((cat) => !OPTIONAL_CATEGORIES.has(cat.id))
+        .filter((cat) => !cat.is_optional)
         .filter((cat) => !catHasFood(mealSel, cat.id))
         .map((cat) => cat.name);
 
@@ -277,7 +279,7 @@ export function useMealPlanner(overrides: FoodOverrides = {}) {
       }
     });
     return incomplete;
-  }, [selections]);
+  }, [selections, meals]);
 
   return {
     selections,

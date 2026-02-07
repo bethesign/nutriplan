@@ -23,6 +23,7 @@ interface Profile {
   height_cm: number | null;
   current_weight_kg: number | null;
   goal: string | null;
+  role?: string;
 }
 
 interface WeightLog {
@@ -313,7 +314,14 @@ export function ProfilePage() {
           <User className="w-7 h-7 text-white" />
         </div>
         <div>
-          <h2 className="text-xl font-semibold text-[#1b4332]">Il mio profilo</h2>
+          <div className="flex items-center gap-2">
+            <h2 className="text-xl font-semibold text-[#1b4332]">Il mio profilo</h2>
+            {profile?.role === "admin" && (
+              <span className="text-[10px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-medium">
+                Admin
+              </span>
+            )}
+          </div>
           <p className="text-sm text-[#95d5b2]">{user?.email}</p>
         </div>
       </div>

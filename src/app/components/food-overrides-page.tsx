@@ -5,17 +5,18 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { apiFetch } from "./supabase-client";
-import { meals } from "./meal-data";
+import type { Meal } from "./types";
 
-// Overrides keyed by food item id → custom weight
+// Overrides keyed by meal_category_food UUID → custom weight
 export type FoodOverrides = Record<string, number>;
 
 interface FoodOverridesPageProps {
+  meals: Meal[];
   overrides: FoodOverrides;
   onOverridesChange: (overrides: FoodOverrides) => void;
 }
 
-export function FoodOverridesPage({ overrides, onOverridesChange }: FoodOverridesPageProps) {
+export function FoodOverridesPage({ meals, overrides, onOverridesChange }: FoodOverridesPageProps) {
   const [localOverrides, setLocalOverrides] = useState<FoodOverrides>({});
   const [saving, setSaving] = useState(false);
   const [search, setSearch] = useState("");
@@ -128,7 +129,7 @@ export function FoodOverridesPage({ overrides, onOverridesChange }: FoodOverride
       });
     });
     return result;
-  }, []);
+  }, [meals]);
 
   return (
     <div className="max-w-4xl mx-auto space-y-5">
