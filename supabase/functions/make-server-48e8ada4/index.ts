@@ -680,6 +680,25 @@ app.get("/make-server-48e8ada4/admin/invitations", requireAdmin, async (c) => {
 
 // ─── ADMIN: Foods CRUD ──────────────────────────────────────
 
+// GET /admin/foods — All foods (including unassigned)
+app.get("/make-server-48e8ada4/admin/foods", requireAdmin, async (c) => {
+  try {
+    const { data, error } = await adminSupabase
+      .from("foods")
+      .select("id, name, note, sub_group, sub_group_icon")
+      .order("name");
+
+    if (error) {
+      return c.json({ error: `Errore: ${error.message}` }, 500);
+    }
+
+    return c.json({ foods: data || [] });
+  } catch (err) {
+    console.log("Error in admin/foods list:", err);
+    return c.json({ error: `Errore: ${err}` }, 500);
+  }
+});
+
 // POST /admin/foods
 app.post("/make-server-48e8ada4/admin/foods", requireAdmin, async (c) => {
   try {
@@ -831,6 +850,61 @@ app.delete("/make-server-48e8ada4/admin/meal-category-foods/:id", requireAdmin, 
 
     return c.json({ status: "ok" });
   } catch (err) {
+    return c.json({ error: `Errore: ${err}` }, 500);
+  }
+});
+
+// ─── ADMIN: Users Management ─────────────────────────────────
+
+// GET /admin/users — List all profiles
+app.get("/make-server-48e8ada4/admin/users", requireAdmin, async (c) => {
+  try {
+    const { data, error } = await adminSupabase
+      .from("profiles")
+      .select("id, email, name, role, created_at")
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      return c.json({ error: `Errore: ${error.message}` }, 500);
+    }
+
+    return c.json({ users: data || [] });
+  } catch (err) {
+    console.log("Error in admin/users:", err);
+    return c.json({ error: `Errore: ${err}` }, 500);
+  }
+});
+
+// PUT /admin/users/:id/role — Change user role
+app.put("/make-server-48e8ada4/admin/users/:id/role", requireAdmin, async (c) => {
+  try {
+    const targetId = c.req.param("id");
+    const currentUser = c.get("user");
+
+    // Prevent removing own admin role
+    if (targetId === currentUser.id) {
+      return c.json({ error: "Non puoi modificare il tuo stesso ruolo." }, 400);
+    }
+
+    const body = await parseBody(c);
+    if (!body?.role || !["admin", "user"].includes(body.role)) {
+      return c.json({ error: "Ruolo non valido. Usa 'admin' o 'user'." }, 400);
+    }
+
+    const { data, error } = await adminSupabase
+      .from("profiles")
+      .update({ role: body.role })
+      .eq("id", targetId)
+      .select("id, email, name, role, created_at")
+      .single();
+
+    if (error) {
+      return c.json({ error: `Errore: ${error.message}` }, 500);
+    }
+
+    return c.json({ user: data });
+  } catch (err) {
+    console.log("Error in admin/users/:id/role:", err);
     return c.json({ error: `Errore: ${err}` }, 500);
   }
 });
